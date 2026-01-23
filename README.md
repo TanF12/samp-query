@@ -25,7 +25,7 @@ samp_query = { git = "https://github.com/TanF12/samp_query" }
 The `SampClient` provides a synchronous interface for single-target queries.
 
 ```rust
-use samp_query::{SampClient, Opcode};
+use samp_query::{SampClient};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -33,19 +33,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = SampClient::new(Duration::from_secs(2))?;
 
     // Query the server
-    // DNS resolution and IPv4/IPv6 handling is automatic
     let info = client.get_info("45.145.224.162:7777")?;
 
     println!("Hostname : {}", info.hostname);
     println!("Players  : {}/{}", info.players, info.max_players);
     println!("Gamemode : {}", info.gamemode);
-    println!("Mapname : {}", info.mapname);
+    println!("Mapname  : {}", info.mapname);
     
-    // Check if it's an open.mp server
+    // You can also get rules
     let rules = client.get_rules("45.145.224.162:7777")?;
-    if client.is_openmp(&rules) {
-        let omp = client.get_openmp_info("45.145.224.162:7777")?;
-        println!("Discord: {}", omp.discord);
+    for rule in rules {
+        println!("{} = {}", rule.name, rule.value);
     }
 
     Ok(())
@@ -65,18 +63,24 @@ fn main() {
         "45.145.224.162:7777".to_string(),
         "server.ls-rp.com:7777".to_string(),
     ];
-
-    // Scan targets with a 1s timeout and 1 retry per server
-    // The internal TokenBucket limits traffic to 2000 PPS per default
-    let results = query_batch(targets, Duration::from_secs(1), 1);
+    // Scan targets with:
+    // - 1s timeout
+    // - 1 retry per server
+    // - 2000 packets per second limit (Global GCRA limit)
+    let results = query_batch(targets, Duration::from_secs(1), 1, 2000).unwrap();
 
     for res in results {
-        match res.info {
+        // The field is named 'result', not 'info'
+        match res.result {
             Ok(info) => println!("[ONLINE] {} - {}", res.target, info.hostname),
             Err(e) => eprintln!("[OFFLINE] {} - Reason: {}", res.target, e),
         }
     }
 }
 ```
+
+## CLI
+
+Check the `examples/` directory for a full, proper CLI implementation.
 
 <sub>Fueled by Hawkwind and Monster energy</sub>

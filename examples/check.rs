@@ -52,7 +52,7 @@ fn run_single_mode(target: &str) {
             println!("└──────────────────────────────────────────────┘");
 
             println!("\nFetching rules...");
-            let rules = match client.get_rules(target) {
+            match client.get_rules(target) {
                 Ok(rules) => {
                     println!("┌──────────────────────────────────────────────┐");
                     if rules.is_empty() {
@@ -67,29 +67,11 @@ fn run_single_mode(target: &str) {
                         }
                     }
                     println!("└──────────────────────────────────────────────┘");
-                    Some(rules)
                 }
                 Err(e) => {
                     println!("Error fetching rules: {}", e);
-                    None
                 }
             };
-
-            if let Some(r) = &rules {
-                if client.is_openmp(r) {
-                    println!("\n[OPEN.MP DETECTED] Fetching metadata...");
-                    if let Ok(omp) = client.get_openmp_info(target) {
-                        println!("┌──────────────────────────────────────────────┐");
-                        if !omp.discord.is_empty() {
-                            println!("│ Discord  : {:<33} │", truncate(&omp.discord, 33));
-                        }
-                        if !omp.logo.is_empty() {
-                            println!("│ Logo     : {:<33} │", truncate(&omp.logo, 33));
-                        }
-                        println!("└──────────────────────────────────────────────┘");
-                    }
-                }
-            }
 
             if info.players > 0 {
                 println!("\nFetching clients...");
@@ -108,39 +90,48 @@ fn run_single_mode(target: &str) {
 fn run_batch_mode(targets: &[String]) {
     println!("Scanning {} servers...", targets.len());
     let start = Instant::now();
-    let results = query_batch(targets.to_vec(), Duration::from_secs(2), 1);
-    let duration = start.elapsed();
 
-    let mut online_count = 0;
+    match query_batch(targets.to_vec(), Duration::from_secs(2), 1, 2000) {
+        Ok(results) => {
+            let duration = start.elapsed();
+            let mut online_count = 0;
 
-    println!("\nRESULTS:");
-    println!("----------------------------------------------------------");
-    println!("{:<20} | {:<7} | {:<30}", "Address", "Players", "Hostname");
-    println!("----------------------------------------------------------");
+            println!("\nRESULTS:");
+            println!("----------------------------------------------------------");
+            println!("{:<20} | {:<7} | {:<30}", "Address", "Players", "Hostname");
+            println!("----------------------------------------------------------");
 
-    for result in results {
-        match result.info {
-            Ok(info) => {
-                online_count += 1;
-                println!(
-                    "{:<20} | {:>7} | {}",
-                    result.target,
-                    format!("{}/{}", info.players, info.max_players),
-                    truncate(&info.hostname, 30)
-                );
+            for result in results {
+                match result.result {
+                    Ok(info) => {
+                        online_count += 1;
+                        println!(
+                            "{:<20} | {:>7} | {}",
+                            result.original_input,
+                            format!("{}/{}", info.players, info.max_players),
+                            truncate(&info.hostname, 30)
+                        );
+                    }
+                    Err(e) => {
+                        println!(
+                            "{:<20} | {:<7} | [ERROR] {}",
+                            result.original_input, "---", e
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                println!("{:<20} | {:<7} | [ERROR] {}", result.target, "---", e);
-            }
+            println!("----------------------------------------------------------");
+            println!(
+                "Online: {}/{} (Time: {:.2?})",
+                online_count,
+                targets.len(),
+                duration
+            );
+        }
+        Err(e) => {
+            eprintln!("Batch scan failed to initialize: {}", e);
         }
     }
-    println!("----------------------------------------------------------");
-    println!(
-        "Online: {}/{} (Time: {:.2?})",
-        online_count,
-        targets.len(),
-        duration
-    );
 }
 
 fn print_error(e: SampError, duration: Duration) {
