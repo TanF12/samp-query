@@ -12,6 +12,7 @@ Add this to your `Cargo.toml`:
 [dependencies]
 samp_query = "0.1.0"
 samp_query = { git = "https://github.com/TanF12/samp_query" }
+```
 
 ## Examples
 
@@ -60,6 +61,7 @@ fn main() {
         }
     }
 }
+```
 
 ### Advanced Configuration
 
