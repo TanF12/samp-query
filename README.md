@@ -1,8 +1,13 @@
-# **SampQuery**
-This is a project for a tool that executes queries to servers using the UDP protocol provided by SAMP. Written in Rust.
+# samp-query
 
-Read more about it at:
+A zero-dependency, high-throughput SA:MP and open.mp query implementation written in pure Rust.
+
+This library implements a custom non-blocking I/O reactor to handle thousands of concurrent queries without the overhead of heavy async runtimes.
+
+Resources I used to understand the quirky SA-MP query mechanism and its edge cases for this implementation:
 - [Documentation - SAMP Query Mechanism](https://open.mp/docs/tutorials/QueryMechanism)
+- [open.mp server's query C++ mechanism](https://github.com/openmultiplayer/open.mp/blob/master/Server/Components/LegacyNetwork/Query/query.cpp)
+- [Southclaws' Go implementation](https://github.com/Southclaws/go-samp-query)
 
 ## Installation
 
@@ -10,83 +15,68 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-samp_query = "0.1.0"
 samp_query = { git = "https://github.com/TanF12/samp_query" }
 ```
 
-## Examples
+## Usage
 
-### Basic Usage
+### Basic Client
 
-The simplest way to query a server using default settings (2s timeout, 2 retries).
+The `SampClient` provides a synchronous interface for single-target queries.
 
 ```rust
-use samp_query::SampClient;
+use samp_query::{SampClient, Opcode};
+use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize the client
-    let client = SampClient::builder().build()?;
+    // Initialize with a global timeout of 2 seconds
+    let client = SampClient::new(Duration::from_secs(2))?;
 
-    // Query the server (DNS resolution is automatic)
-    let info = client.get_information("45.145.224.162:6969")?;
+    // Query the server
+    // DNS resolution and IPv4/IPv6 handling is automatic
+    let info = client.get_info("45.145.224.162:7777")?;
 
-    println!("Hostname: {}", info.hostname);
-    println!("Players : {}/{}", info.players, info.max_players);
-    println!("Gamemode: {}", info.gamemode);
+    println!("Hostname : {}", info.hostname);
+    println!("Players  : {}/{}", info.players, info.max_players);
+    println!("Gamemode : {}", info.gamemode);
+    println!("Mapname : {}", info.mapname);
     
+    // Check if it's an open.mp server
+    let rules = client.get_rules("45.145.224.162:7777")?;
+    if client.is_openmp(&rules) {
+        let omp = client.get_openmp_info("45.145.224.162:7777")?;
+        println!("Discord: {}", omp.discord);
+    }
+
     Ok(())
 }
 ```
 
-### Batch Querying
+### Batch Scan
 
-To query multiple servers in parallel using the built-in thread pool:
+To query multiple servers, use `query_batch`. Unlike usual thread pools, this uses a non-blocking socket reactor to handle I/O.
 
 ```rust
 use samp_query::query_batch;
+use std::time::Duration;
 
 fn main() {
     let targets = vec![
-        "45.145.224.162:6969".to_string(),
+        "45.145.224.162:7777".to_string(),
         "server.ls-rp.com:7777".to_string(),
     ];
 
-    // Query targets using 4 worker threads
-    let results = query_batch(targets, 4);
+    // Scan targets with a 1s timeout and 1 retry per server
+    // The internal TokenBucket limits traffic to 2000 PPS per default
+    let results = query_batch(targets, Duration::from_secs(1), 1);
 
-    for (ip, result) in results {
-        match result {
-            Ok(info) => println!("[{}] {}", ip, info.hostname),
-            Err(e) => eprintln!("[{}] Error: {}", ip, e),
+    for res in results {
+        match res.info {
+            Ok(info) => println!("[ONLINE] {} - {}", res.target, info.hostname),
+            Err(e) => eprintln!("[OFFLINE] {} - Reason: {}", res.target, e),
         }
     }
 }
 ```
 
-### Advanced Configuration
-
-For production environments, you might want to tune timeouts or bind to specific ports.
-
-```rust
-use samp_query::SampClient;
-use std::time::Duration;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = SampClient::builder()
-        .timeout(Duration::from_secs(5)) // Increased timeout for slow networks
-        .retries(3) // Retry up to 3 times on packet loss
-        .bind_port(0)  // 0 = Let OS choose a random port
-        .build()?;
-
-    match client.get_information("server.ls-rp.com:7777") {
-        Ok(info) => println!("Server is Online: {:?}", info),
-        Err(e) => eprintln!("Failed to query: {}", e),
-    }
-
-    Ok(())
-}
-```
-
-## CLI
-
-Check the `examples/` directory for a full CLI implementation.
+<sub>Fueled by Hawkwind and Monster energy</sub>

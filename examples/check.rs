@@ -1,6 +1,6 @@
 use samp_query::{SampClient, SampError, query_batch};
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -18,91 +18,153 @@ fn main() {
 }
 
 fn print_help() {
-    println!("Uso:");
-    println!("  Single server : cargo run -- <IP:PORT>");
-    println!("  Multiple servers (//) : cargo run -- <IP1> <IP2> <IP3> ...");
-    println!("\nExample:");
-    println!("  cargo run -- 45.145.224.162:6969");
+    println!("Usage:");
+    println!("  Single server : cargo run --example check -- <IP:PORT>");
+    println!("  Batch scan    : cargo run --example check -- <IP1> <IP2> <IP3> ...");
 }
 
 fn run_single_mode(target: &str) {
-    println!("Querying {}...", target);
+    println!("Connecting to {}...", target);
 
-    let client = SampClient::builder()
-        .timeout(Duration::from_secs(4))
-        .retries(2)
-        .build()
-        .expect("Couldn't create UDP socket");
+    let client = SampClient::new(Duration::from_secs(2)).expect("Failed to initialize UDP socket");
 
-    let start = std::time::Instant::now();
-    let result = client.get_information(target);
-    let duration = start.elapsed();
+    let start = Instant::now();
 
-    match result {
+    match client.get_info(target) {
         Ok(info) => {
-            let players_str = format!("{} / {}", info.players, info.max_players);
-            let password_str = if info.has_password { "Yes" } else { "No" };
+            let rtt = start.elapsed();
 
-            println!("\nSERVER ({:.2?})", duration);
+            println!("\nSERVER INFO (RTT: {:.2?})", rtt);
             println!("┌──────────────────────────────────────────────┐");
             println!("│ Hostname : {:<33} │", truncate(&info.hostname, 33));
             println!("│ Gamemode : {:<33} │", truncate(&info.gamemode, 33));
-            println!("│ Map      : {:<33} │", truncate(&info.mapname, 33));
+            println!("│ Language : {:<33} │", truncate(&info.mapname, 33));
             println!("├──────────────────────────────────────────────┤");
-            println!("│ Players  : {:<33} │", players_str);
-            println!("│ Password : {:<33} │", password_str);
-            println!("└──────────────────────────────────────────────┘\n");
+            println!(
+                "│ Players  : {:<12} {:>20} │",
+                format!("{}/{}", info.players, info.max_players),
+                if info.password {
+                    "Pass: Yes"
+                } else {
+                    "Pass: No"
+                }
+            );
+            println!("└──────────────────────────────────────────────┘");
+
+            println!("\nFetching rules...");
+            let rules = match client.get_rules(target) {
+                Ok(rules) => {
+                    println!("┌──────────────────────────────────────────────┐");
+                    if rules.is_empty() {
+                        println!("│ {:<44} │", "No rules defined");
+                    } else {
+                        for rule in rules.iter().take(8) {
+                            let line = format!("{} = {}", rule.name, rule.value);
+                            println!("│ {:<44} │", truncate(&line, 44));
+                        }
+                        if rules.len() > 8 {
+                            println!("│ ... and {} more {:<23} │", rules.len() - 8, "");
+                        }
+                    }
+                    println!("└──────────────────────────────────────────────┘");
+                    Some(rules)
+                }
+                Err(e) => {
+                    println!("Error fetching rules: {}", e);
+                    None
+                }
+            };
+
+            if let Some(r) = &rules {
+                if client.is_openmp(r) {
+                    println!("\n[OPEN.MP DETECTED] Fetching metadata...");
+                    if let Ok(omp) = client.get_openmp_info(target) {
+                        println!("┌──────────────────────────────────────────────┐");
+                        if !omp.discord.is_empty() {
+                            println!("│ Discord  : {:<33} │", truncate(&omp.discord, 33));
+                        }
+                        if !omp.logo.is_empty() {
+                            println!("│ Logo     : {:<33} │", truncate(&omp.logo, 33));
+                        }
+                        println!("└──────────────────────────────────────────────┘");
+                    }
+                }
+            }
+
+            if info.players > 0 {
+                println!("\nFetching clients...");
+                match client.get_clients(target) {
+                    Ok(clients) => print_basic_clients(&clients),
+                    Err(e) => println!("Could not retrieve players: {}", e),
+                }
+            } else {
+                println!("\nNo players online.");
+            }
         }
-        Err(e) => print_error(e, duration),
+        Err(e) => print_error(e, start.elapsed()),
     }
 }
 
 fn run_batch_mode(targets: &[String]) {
-    println!("Starting parallel scan on {} servers...", targets.len());
-    let start = std::time::Instant::now();
-    let results = query_batch(targets.to_vec(), 8);
+    println!("Scanning {} servers...", targets.len());
+    let start = Instant::now();
+    let results = query_batch(targets.to_vec(), Duration::from_secs(2), 1);
     let duration = start.elapsed();
+
     let mut online_count = 0;
 
     println!("\nRESULTS:");
-    println!("------------------------------------------------");
-    for (ip, res) in results {
-        match res {
+    println!("----------------------------------------------------------");
+    println!("{:<20} | {:<7} | {:<30}", "Address", "Players", "Hostname");
+    println!("----------------------------------------------------------");
+
+    for result in results {
+        match result.info {
             Ok(info) => {
                 online_count += 1;
-                println!("[ONLINE] {:<20} | {}", ip, info.hostname);
+                println!(
+                    "{:<20} | {:>7} | {}",
+                    result.target,
+                    format!("{}/{}", info.players, info.max_players),
+                    truncate(&info.hostname, 30)
+                );
             }
             Err(e) => {
-                println!("[ERROR ] {:<20} | {}", ip, e);
+                println!("{:<20} | {:<7} | [ERROR] {}", result.target, "---", e);
             }
         }
     }
-    println!("------------------------------------------------");
+    println!("----------------------------------------------------------");
     println!(
-        "Scan finished in {:.2?}. Online: {}/{}",
-        duration,
+        "Online: {}/{} (Time: {:.2?})",
         online_count,
-        targets.len()
+        targets.len(),
+        duration
     );
 }
 
 fn print_error(e: SampError, duration: Duration) {
     eprintln!("\nCONNECTION FAILED ({:.2?})", duration);
     eprintln!("   Reason: {}", e);
-
-    match e {
-        SampError::Io(_) => {
-            eprintln!("   Check whether the IP address is correct and the server is online.")
-        }
-        SampError::PacketTooShort => {
-            eprintln!("    Response does not match expected protocol.")
-        }
-        SampError::OriginMismatch => {
-            eprintln!("   Response came from a different IP (possible IP spoofing).")
-        }
-        _ => {}
-    }
     std::process::exit(1);
+}
+
+fn print_basic_clients(clients: &[samp_query::ServerClient]) {
+    println!("┌──────────────────────────────────────────────┐");
+    println!("│ {:<25} │ {:>16} │", "Name", "Score");
+    println!("├──────────────────────────────────────────────┤");
+    for (i, player) in clients.iter().enumerate() {
+        if i >= 15 {
+            println!("│ ... and {} more {:<23} │", clients.len() - 15, "");
+            break;
+        }
+        println!(
+            "│ {:<25} │ {:>16} │",
+            truncate(&player.name, 25),
+            player.score
+        );
+    }
+    println!("└──────────────────────────────────────────────┘");
 }
 
 fn truncate(s: &str, max_width: usize) -> String {
