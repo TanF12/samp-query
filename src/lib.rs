@@ -1,13 +1,14 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fmt;
+use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
-use std::str;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // Constantes e lookup tables
 const SAMP_MAGIC: &[u8; 4] = b"SAMP";
@@ -76,7 +77,10 @@ impl fmt::Display for SampError {
 
 impl From<io::Error> for SampError {
     fn from(e: io::Error) -> Self {
-        SampError::Io(e)
+        match e.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => SampError::Timeout,
+            _ => SampError::Io(e),
+        }
     }
 }
 
@@ -136,34 +140,31 @@ impl<'a> ByteReader<'a> {
         }
     }
 
-    #[inline(always)]
-    fn check_bounds(&self, len: usize) -> Result<(), SampError> {
-        if self.cursor + len > self.inner.len() {
-            Err(SampError::BufferUnderflow)
-        } else {
-            Ok(())
-        }
-    }
-
     fn read_u8(&mut self) -> Result<u8, SampError> {
-        self.check_bounds(1)?;
-        let b = self.inner[self.cursor];
+        let &b = self
+            .inner
+            .get(self.cursor)
+            .ok_or(SampError::BufferUnderflow)?;
         self.cursor += 1;
         Ok(b)
     }
 
     fn read_le_u16(&mut self) -> Result<u16, SampError> {
-        self.check_bounds(2)?;
-        let bytes = self.inner[self.cursor..self.cursor + 2].try_into().unwrap();
+        let slice = self
+            .inner
+            .get(self.cursor..self.cursor + 2)
+            .ok_or(SampError::BufferUnderflow)?;
         self.cursor += 2;
-        Ok(u16::from_le_bytes(bytes))
+        Ok(u16::from_le_bytes(slice.try_into().unwrap()))
     }
 
     fn read_le_u32(&mut self) -> Result<u32, SampError> {
-        self.check_bounds(4)?;
-        let bytes = self.inner[self.cursor..self.cursor + 4].try_into().unwrap();
+        let slice = self
+            .inner
+            .get(self.cursor..self.cursor + 4)
+            .ok_or(SampError::BufferUnderflow)?;
         self.cursor += 4;
-        Ok(u32::from_le_bytes(bytes))
+        Ok(u32::from_le_bytes(slice.try_into().unwrap()))
     }
 
     fn read_le_i32(&mut self) -> Result<i32, SampError> {
@@ -171,8 +172,10 @@ impl<'a> ByteReader<'a> {
     }
 
     fn read_str_len(&mut self, len: usize) -> Result<Cow<'a, str>, SampError> {
-        self.check_bounds(len)?;
-        let slice = &self.inner[self.cursor..self.cursor + len];
+        let slice = self
+            .inner
+            .get(self.cursor..self.cursor + len)
+            .ok_or(SampError::BufferUnderflow)?;
         self.cursor += len;
 
         if slice.iter().all(|&b| b < 128) {
@@ -181,17 +184,14 @@ impl<'a> ByteReader<'a> {
             ));
         }
 
-        let s: String = slice
-            .iter()
-            .map(|&b| {
-                if b < 128 {
-                    b as char
-                } else {
-                    CP1251_TABLE[(b - 0x80) as usize]
-                }
-            })
-            .collect();
-
+        let mut s = String::with_capacity(len);
+        for &b in slice {
+            s.push(if b < 128 {
+                b as char
+            } else {
+                CP1251_TABLE[(b - 0x80) as usize]
+            });
+        }
         Ok(Cow::Owned(s))
     }
 
@@ -211,7 +211,7 @@ impl<'a> ByteReader<'a> {
 
 struct GcraLimiter {
     emission_interval: u64,
-    tat: Instant,
+    pub tat: Instant,
 }
 
 impl GcraLimiter {
@@ -222,13 +222,13 @@ impl GcraLimiter {
         }
     }
 
-    fn check(&mut self) -> bool {
-        let now = Instant::now();
+    fn check(&mut self, now: Instant) -> bool {
         if now < self.tat {
-            return false;
+            false
+        } else {
+            self.tat = now.max(self.tat) + Duration::from_nanos(self.emission_interval);
+            true
         }
-        self.tat = now + Duration::from_nanos(self.emission_interval);
-        true
     }
 }
 
@@ -238,15 +238,10 @@ struct FastRng {
 
 impl FastRng {
     fn new() -> Self {
-        let start = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64;
-
-        let addr_entropy = &start as *const _ as u64;
-
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0);
         Self {
-            state: start ^ addr_entropy,
+            state: hasher.finish(),
         }
     }
 
@@ -314,10 +309,7 @@ fn validate_header(
 
     match effective_addr {
         SocketAddr::V4(ip) => {
-            if buf[4..8] != ip.ip().octets() {
-                return Err(SampError::SpoofedOrigin);
-            }
-            if buf[8..10] != ip.port().to_le_bytes() {
+            if buf[4..8] != ip.ip().octets() || buf[8..10] != ip.port().to_le_bytes() {
                 return Err(SampError::SpoofedOrigin);
             }
         }
@@ -327,7 +319,6 @@ fn validate_header(
             }
         }
     }
-
     Ok(())
 }
 
@@ -337,18 +328,27 @@ pub struct SampClient {
 
 impl SampClient {
     pub fn new(timeout: Duration) -> Result<Self, SampError> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-
+        let socket = UdpSocket::bind("[::]:0").or_else(|_| UdpSocket::bind("0.0.0.0:0"))?;
         socket.set_read_timeout(Some(timeout))?;
         socket.set_write_timeout(Some(timeout))?;
         Ok(Self { socket })
     }
 
     fn resolve(&self, target: impl ToSocketAddrs) -> Result<SocketAddr, SampError> {
-        target
-            .to_socket_addrs()?
-            .next()
-            .ok_or(SampError::ResolutionFailed)
+        let mut addrs = target.to_socket_addrs()?;
+        let first = addrs.next().ok_or(SampError::ResolutionFailed)?;
+
+        if first.is_ipv4() {
+            return Ok(first);
+        }
+
+        for addr in addrs {
+            if addr.is_ipv4() {
+                return Ok(addr);
+            }
+        }
+
+        Ok(first)
     }
 
     fn send_recv<F, T>(
@@ -445,64 +445,98 @@ impl SampClient {
     }
 }
 
+enum Event {
+    Resolved(String, Option<SocketAddr>),
+    Packet(SocketAddr, Result<ServerInfo<'static>, SampError>),
+}
+
 struct PendingRequest {
     original_input: String,
     sent_at: Instant,
     retries_left: u8,
 }
 
-pub fn query_batch(
+#[derive(Clone, Eq, PartialEq)]
+struct DelayedRequest {
+    host: String,
+    addr: SocketAddr,
+    retries_left: usize,
+    ready_at: Instant,
+}
+
+impl Ord for DelayedRequest {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other.ready_at.cmp(&self.ready_at)
+    }
+}
+
+impl PartialOrd for DelayedRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub fn query_info_batch(
     targets: Vec<String>,
     timeout: Duration,
     retries: usize,
     global_pps: u64,
+    dns_threads: usize,
 ) -> Result<Vec<BatchResult>, SampError> {
-    let socket = UdpSocket::bind("[::]:0")?;
+    let dns_threads = dns_threads.max(1);
 
-    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
-
+    let socket = UdpSocket::bind("[::]:0").or_else(|_| UdpSocket::bind("0.0.0.0:0"))?;
     let socket_rx = socket.try_clone()?;
-
-    let (tx_resolve, rx_resolve) = mpsc::sync_channel(1024);
-    let (tx_recv, rx_recv) = mpsc::channel();
-    let total_targets = targets.len();
-
+    socket_rx.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let (tx_event, rx_event) = mpsc::channel::<Event>();
     let should_exit = &AtomicBool::new(false);
-
+    let total_targets = targets.len();
     let mut results = Vec::with_capacity(total_targets);
 
     thread::scope(|s| {
-        s.spawn(move || {
-            for target in targets {
-                if should_exit.load(Ordering::Relaxed) {
-                    break;
+        let mut worker_txs = Vec::with_capacity(dns_threads);
+        for _ in 0..dns_threads {
+            let (tx, rx) = mpsc::channel::<String>();
+            worker_txs.push(tx);
+            let tx_event_clone = tx_event.clone();
+
+            s.spawn(move || {
+                for target in rx {
+                    if should_exit.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let addr_res = target.to_socket_addrs().ok().and_then(|mut i| {
+                        let addrs: Vec<_> = i.by_ref().collect();
+                        addrs
+                            .iter()
+                            .find(|a| a.is_ipv4())
+                            .copied()
+                            .or_else(|| addrs.first().copied())
+                    });
+                    if tx_event_clone
+                        .send(Event::Resolved(target, addr_res))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
+            });
+        }
 
-                let addr_res = target.to_socket_addrs().map(|mut i| {
-                    let addrs: Vec<_> = i.by_ref().collect();
-                    addrs
-                        .iter()
-                        .find(|a| a.is_ipv4())
-                        .copied()
-                        .or_else(|| addrs.first().copied())
-                });
+        for (i, target) in targets.into_iter().enumerate() {
+            let _ = worker_txs[i % dns_threads].send(target);
+        }
+        drop(worker_txs);
 
-                if tx_resolve.send((target, addr_res)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let tx_recv_clone = tx_recv.clone();
+        let tx_event_rx = tx_event.clone();
         s.spawn(move || {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             while !should_exit.load(Ordering::Relaxed) {
                 match socket_rx.recv_from(&mut buf) {
                     Ok((len, src)) => {
-                        if len > 11 && &buf[0..4] == SAMP_MAGIC && buf[10] == Opcode::Info as u8 {
+                        if validate_header(&buf, len, src, Opcode::Info).is_ok() {
+                            let mut r = ByteReader::new(&buf[11..len]);
                             let res = (|| {
-                                validate_header(&buf, len, src, Opcode::Info)?;
-                                let mut r = ByteReader::new(&buf[11..len]);
                                 Ok(ServerInfo {
                                     password: r.read_u8()? != 0,
                                     players: r.read_le_u16()?,
@@ -514,7 +548,7 @@ pub fn query_batch(
                                 .into_owned())
                             })();
 
-                            if tx_recv_clone.send((src, res)).is_err() {
+                            if tx_event_rx.send(Event::Packet(src, res)).is_err() {
                                 break;
                             }
                         }
@@ -530,115 +564,162 @@ pub fn query_batch(
             }
         });
 
-        let mut pending = HashMap::with_capacity(total_targets);
-        let mut send_queue = VecDeque::new();
+        let mut pending: HashMap<SocketAddr, PendingRequest> =
+            HashMap::with_capacity(total_targets);
+        let mut send_queue: VecDeque<(String, SocketAddr, usize)> = VecDeque::new();
+        let mut delayed_queue: BinaryHeap<DelayedRequest> = BinaryHeap::new();
+        let mut timeout_queue: VecDeque<(SocketAddr, Instant)> = VecDeque::new();
+        let mut ip_cleanup_queue: VecDeque<(IpAddr, Instant)> = VecDeque::new();
         let mut global_limiter = GcraLimiter::new(global_pps);
         let mut ip_last_sent: HashMap<IpAddr, Instant> = HashMap::new();
-
         let mut resolved_count = 0;
         let mut send_buf = [0u8; 128];
-        let deadline = Instant::now() + timeout + Duration::from_secs(2);
+        let deadline = Instant::now() + timeout + Duration::from_secs(3);
 
         loop {
             let now = Instant::now();
 
-            while let Ok((host, res)) = rx_resolve.try_recv() {
-                resolved_count += 1;
-                match res {
-                    Ok(Some(addr)) => send_queue.push_back((host, addr, retries)),
-                    _ => results.push(BatchResult {
-                        target: SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
-                        original_input: host,
-                        result: Err(SampError::ResolutionFailed),
-                        rtt: Duration::ZERO,
-                    }),
+            while let Some(&(addr, expire_time)) = timeout_queue.front() {
+                if now >= expire_time {
+                    timeout_queue.pop_front();
+                    if let Some(req) = pending.remove(&addr) {
+                        if req.retries_left > 0 {
+                            send_queue.push_back((
+                                req.original_input,
+                                addr,
+                                (req.retries_left - 1) as usize,
+                            ));
+                        } else {
+                            results.push(BatchResult {
+                                target: addr,
+                                original_input: req.original_input,
+                                result: Err(SampError::Timeout),
+                                rtt: timeout,
+                            });
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            while let Some(req) = delayed_queue.peek() {
+                if now >= req.ready_at {
+                    let req = delayed_queue.pop().unwrap();
+                    send_queue.push_back((req.host, req.addr, req.retries_left));
+                } else {
+                    break;
                 }
             }
 
             while !send_queue.is_empty() {
-                if !global_limiter.check() {
+                if !global_limiter.check(now) {
                     break;
                 }
 
-                if let Some((host, addr, retries_left)) = send_queue.pop_front() {
-                    let is_rate_limited = ip_last_sent
-                        .get(&addr.ip())
-                        .map(|last| now.duration_since(*last) < MIN_INTERVAL_PER_IP)
-                        .unwrap_or(false);
+                let (host, addr, retries_left) = send_queue.pop_front().unwrap();
 
-                    if is_rate_limited {
-                        send_queue.push_front((host, addr, retries_left));
-                        break;
-                    }
-
-                    ip_last_sent.insert(addr.ip(), now);
-                    let len = build_packet(&mut send_buf, addr, Opcode::Info, None);
-
-                    if socket.send_to(&send_buf[..len], addr).is_ok() {
-                        let normalized_addr = normalize_addr(addr);
-
-                        pending.insert(
-                            normalized_addr,
-                            PendingRequest {
-                                original_input: host,
-                                sent_at: now,
-                                retries_left: retries_left as u8,
-                            },
-                        );
-                    }
-                }
-            }
-
-            while let Ok((src, res)) = rx_recv.try_recv() {
-                let normalized_src = normalize_addr(src);
-
-                if let Some(req) = pending.remove(&normalized_src) {
-                    results.push(BatchResult {
-                        target: normalized_src,
-                        original_input: req.original_input,
-                        result: res,
-                        rtt: now.duration_since(req.sent_at),
-                    });
-                }
-            }
-
-            let mut timeouts = Vec::new();
-            for (addr, req) in pending.iter() {
-                if now.duration_since(req.sent_at) > timeout {
-                    timeouts.push(*addr);
-                }
-            }
-
-            for addr in timeouts {
-                if let Some(req) = pending.remove(&addr) {
-                    if req.retries_left > 0 {
-                        send_queue.push_back((
-                            req.original_input,
+                if let Some(&last_sent) = ip_last_sent.get(&addr.ip()) {
+                    if now.duration_since(last_sent) < MIN_INTERVAL_PER_IP {
+                        delayed_queue.push(DelayedRequest {
+                            host,
                             addr,
-                            (req.retries_left - 1) as usize,
-                        ));
-                    } else {
-                        results.push(BatchResult {
-                            target: addr,
-                            original_input: req.original_input,
-                            result: Err(SampError::Timeout),
-                            rtt: timeout,
+                            retries_left,
+                            ready_at: last_sent + MIN_INTERVAL_PER_IP,
                         });
+                        continue;
                     }
+                }
+
+                ip_last_sent.insert(addr.ip(), now);
+                ip_cleanup_queue.push_back((addr.ip(), now + MIN_INTERVAL_PER_IP));
+                let len = build_packet(&mut send_buf, addr, Opcode::Info, None);
+
+                if socket.send_to(&send_buf[..len], addr).is_ok() {
+                    let n_addr = normalize_addr(addr);
+                    pending.insert(
+                        n_addr,
+                        PendingRequest {
+                            original_input: host,
+                            sent_at: now,
+                            retries_left: retries_left as u8,
+                        },
+                    );
+                    timeout_queue.push_back((n_addr, now + timeout));
                 }
             }
 
-            if (resolved_count == total_targets && pending.is_empty() && send_queue.is_empty())
+            while let Some(&(ip, expire)) = ip_cleanup_queue.front() {
+                if now >= expire {
+                    ip_cleanup_queue.pop_front();
+                    if let std::collections::hash_map::Entry::Occupied(e) = ip_last_sent.entry(ip) {
+                        if *e.get() <= expire - MIN_INTERVAL_PER_IP {
+                            e.remove();
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if (resolved_count == total_targets
+                && pending.is_empty()
+                && send_queue.is_empty()
+                && delayed_queue.is_empty())
                 || now > deadline
             {
                 should_exit.store(true, Ordering::Relaxed);
                 break;
             }
 
-            thread::sleep(Duration::from_millis(1));
-        }
+            let mut sleep_until = deadline;
+            if let Some(&(_, exp)) = timeout_queue.front() {
+                sleep_until = sleep_until.min(exp);
+            }
+            if let Some(req) = delayed_queue.peek() {
+                sleep_until = sleep_until.min(req.ready_at);
+            }
+            if !send_queue.is_empty() {
+                sleep_until = sleep_until.min(global_limiter.tat);
+            }
 
-        drop(rx_recv);
+            let timeout_dur = sleep_until.saturating_duration_since(Instant::now());
+            let event = if timeout_dur.is_zero() {
+                rx_event
+                    .try_recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Timeout)
+            } else {
+                rx_event.recv_timeout(timeout_dur)
+            };
+
+            match event {
+                Ok(Event::Resolved(host, Some(addr))) => {
+                    resolved_count += 1;
+                    send_queue.push_back((host, addr, retries));
+                }
+                Ok(Event::Resolved(host, None)) => {
+                    resolved_count += 1;
+                    results.push(BatchResult {
+                        target: SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0),
+                        original_input: host,
+                        result: Err(SampError::ResolutionFailed),
+                        rtt: Duration::ZERO,
+                    });
+                }
+                Ok(Event::Packet(src, res)) => {
+                    let n_src = normalize_addr(src);
+                    if let Some(req) = pending.remove(&n_src) {
+                        results.push(BatchResult {
+                            target: n_src,
+                            original_input: req.original_input,
+                            result: res,
+                            rtt: Instant::now().saturating_duration_since(req.sent_at),
+                        });
+                    }
+                }
+                Err(_) => {}
+            }
+        }
     });
 
     Ok(results)

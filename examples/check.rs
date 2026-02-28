@@ -1,161 +1,374 @@
-use samp_query::{SampClient, SampError, query_batch};
+use samp_query::{SampClient, query_info_batch};
 use std::env;
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+struct Config {
+    targets: Vec<String>,
+    timeout: Duration,
+    json: bool,
+    batch: bool,
+    retry: usize,
+}
 
-    if args.len() <= 1 {
-        print_help();
+fn main() {
+    let stdout = io::stdout();
+    let mut handle = std::io::BufWriter::new(stdout.lock());
+
+    let config = match parse_args() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(handle, "Error: {}", e);
+            print_help(&mut handle);
+            return;
+        }
+    };
+
+    if config.targets.is_empty() {
+        print_help(&mut handle);
         return;
     }
 
-    if args.len() > 2 {
-        run_batch_mode(&args[1..]);
+    if config.batch {
+        run_batch_mode(&mut handle, config);
     } else {
-        run_single_mode(&args[1]);
+        run_single_mode(&mut handle, config);
     }
 }
 
-fn print_help() {
-    println!("Usage:");
-    println!("  Single server : cargo run --example check -- <IP:PORT>");
-    println!("  Batch scan    : cargo run --example check -- <IP1> <IP2> <IP3> ...");
-}
+fn run_single_mode<W: Write>(w: &mut W, cfg: Config) {
+    let target = &cfg.targets[0];
 
-fn run_single_mode(target: &str) {
-    println!("Connecting to {}...", target);
+    if !cfg.json {
+        let _ = writeln!(w, "Connecting to {}...", target);
+    }
 
-    let client = SampClient::new(Duration::from_secs(2)).expect("Failed to initialize UDP socket");
+    let client = match SampClient::new(cfg.timeout) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = writeln!(w, "Failed to bind socket: {}", e);
+            return;
+        }
+    };
 
     let start = Instant::now();
+    let info_res = client.get_info(target);
+    let rules_res = client.get_rules(target);
+    let clients_res = client.get_clients(target);
+    let ping_res = client.get_ping(target);
+    let rtt = start.elapsed();
 
-    match client.get_info(target) {
+    if cfg.json {
+        if let Ok(info) = info_res {
+            let _ = writeln!(w, "{{");
+            let _ = writeln!(w, "  \"hostname\": {:?},", info.hostname);
+            let _ = writeln!(w, "  \"players\": {},", info.players);
+            let _ = writeln!(w, "  \"max_players\": {},", info.max_players);
+            let _ = writeln!(w, "  \"gamemode\": {:?},", info.gamemode);
+            let _ = writeln!(w, "  \"language\": {:?},", info.mapname);
+            let _ = writeln!(w, "  \"password\": {}", info.password);
+            let _ = writeln!(w, "}}");
+        } else {
+            let _ = writeln!(w, "{{ \"error\": \"Connection failed\" }}");
+        }
+        return;
+    }
+
+    match info_res {
         Ok(info) => {
-            let rtt = start.elapsed();
+            let ping_display = ping_res
+                .map(|p| format!("{:.0}ms", p.as_millis()))
+                .unwrap_or_else(|_| "N/A".to_string());
 
-            println!("\nSERVER INFO (RTT: {:.2?})", rtt);
-            println!("┌──────────────────────────────────────────────┐");
-            println!("│ Hostname : {:<33} │", truncate(&info.hostname, 33));
-            println!("│ Gamemode : {:<33} │", truncate(&info.gamemode, 33));
-            println!("│ Language : {:<33} │", truncate(&info.mapname, 33));
-            println!("├──────────────────────────────────────────────┤");
-            println!(
-                "│ Players  : {:<12} {:>20} │",
+            let _ = writeln!(w, "\n{}", style("SERVER ONLINE", "32;1")); // Green Bold
+
+            let mut table = Table::new();
+            table.add_row(vec!["Address".to_string(), target.to_string()]);
+            table.add_row(vec!["Hostname".to_string(), info.hostname.to_string()]);
+            table.add_row(vec![
+                "Ping".to_string(),
+                format!("{} (Total RTT: {:.2?})", ping_display, rtt),
+            ]);
+            table.add_row(vec!["Gamemode".to_string(), info.gamemode.to_string()]);
+            table.add_row(vec!["Language".to_string(), info.mapname.to_string()]);
+            table.add_row(vec![
+                "Players".to_string(),
                 format!("{}/{}", info.players, info.max_players),
+            ]);
+            table.add_row(vec![
+                "Password".to_string(),
                 if info.password {
-                    "Pass: Yes"
+                    "Yes".to_string()
                 } else {
-                    "Pass: No"
-                }
-            );
-            println!("└──────────────────────────────────────────────┘");
+                    "No".to_string()
+                },
+            ]);
+            table.print(w);
 
-            println!("\nFetching rules...");
-            match client.get_rules(target) {
-                Ok(rules) => {
-                    println!("┌──────────────────────────────────────────────┐");
-                    if rules.is_empty() {
-                        println!("│ {:<44} │", "No rules defined");
-                    } else {
-                        for rule in rules.iter().take(8) {
-                            let line = format!("{} = {}", rule.name, rule.value);
-                            println!("│ {:<44} │", truncate(&line, 44));
-                        }
-                        if rules.len() > 8 {
-                            println!("│ ... and {} more {:<23} │", rules.len() - 8, "");
-                        }
+            if let Ok(rules) = rules_res {
+                if !rules.is_empty() {
+                    let _ = writeln!(w, "\n{}", style("RULES", "1"));
+                    let mut rule_table = Table::new();
+                    let mid = (rules.len() as f32 / 2.0).ceil() as usize;
+                    for i in 0..mid {
+                        let left = &rules[i];
+                        let right = rules.get(i + mid);
+
+                        let r_name = right.map(|r| r.name.as_str()).unwrap_or("");
+                        let r_val = right.map(|r| r.value.as_str()).unwrap_or("");
+
+                        rule_table.add_row(vec![
+                            left.name.clone(),
+                            left.value.clone(),
+                            "|".to_string(),
+                            r_name.to_string(),
+                            r_val.to_string(),
+                        ]);
                     }
-                    println!("└──────────────────────────────────────────────┘");
+                    rule_table.print(w);
                 }
-                Err(e) => {
-                    println!("Error fetching rules: {}", e);
-                }
-            };
+            }
 
             if info.players > 0 {
-                println!("\nFetching clients...");
-                match client.get_clients(target) {
-                    Ok(clients) => print_basic_clients(&clients),
-                    Err(e) => println!("Could not retrieve players: {}", e),
-                }
-            } else {
-                println!("\nNo players online.");
-            }
-        }
-        Err(e) => print_error(e, start.elapsed()),
-    }
-}
+                if let Ok(clients) = clients_res {
+                    let _ = writeln!(w, "\n{} (Top 20)", style("PLAYERS", "1"));
+                    let mut client_table = Table::new();
+                    client_table.set_headers(vec!["ID", "Name", "Score"]);
 
-fn run_batch_mode(targets: &[String]) {
-    println!("Scanning {} servers...", targets.len());
-    let start = Instant::now();
-
-    match query_batch(targets.to_vec(), Duration::from_secs(2), 1, 2000) {
-        Ok(results) => {
-            let duration = start.elapsed();
-            let mut online_count = 0;
-
-            println!("\nRESULTS:");
-            println!("----------------------------------------------------------");
-            println!("{:<20} | {:<7} | {:<30}", "Address", "Players", "Hostname");
-            println!("----------------------------------------------------------");
-
-            for result in results {
-                match result.result {
-                    Ok(info) => {
-                        online_count += 1;
-                        println!(
-                            "{:<20} | {:>7} | {}",
-                            result.original_input,
-                            format!("{}/{}", info.players, info.max_players),
-                            truncate(&info.hostname, 30)
-                        );
+                    for (i, c) in clients.iter().take(20).enumerate() {
+                        client_table.add_row(vec![
+                            i.to_string(),
+                            c.name.clone(),
+                            c.score.to_string(),
+                        ]);
                     }
-                    Err(e) => {
-                        println!(
-                            "{:<20} | {:<7} | [ERROR] {}",
-                            result.original_input, "---", e
-                        );
+                    client_table.print(w);
+                    if clients.len() > 20 {
+                        let _ = writeln!(w, "... and {} more.", clients.len() - 20);
                     }
                 }
             }
-            println!("----------------------------------------------------------");
-            println!(
-                "Online: {}/{} (Time: {:.2?})",
-                online_count,
-                targets.len(),
-                duration
-            );
         }
         Err(e) => {
-            eprintln!("Batch scan failed to initialize: {}", e);
+            let _ = writeln!(w, "\n{}", style("CONNECTION FAILED", "31;1"));
+            let _ = writeln!(w, "Reason: {}", e);
         }
     }
 }
 
-fn print_error(e: SampError, duration: Duration) {
-    eprintln!("\nCONNECTION FAILED ({:.2?})", duration);
-    eprintln!("   Reason: {}", e);
-    std::process::exit(1);
-}
+fn run_batch_mode<W: Write>(w: &mut W, cfg: Config) {
+    if !cfg.json {
+        let _ = writeln!(
+            w,
+            "Scanning {} targets (Chunked Stream)...",
+            cfg.targets.len()
+        );
+        let _ = writeln!(
+            w,
+            "{:<21} {:<9} {:<15} {}",
+            "ADDRESS", "PLAYERS", "PING", "HOSTNAME"
+        );
+        let _ = writeln!(w, "{}", "-".repeat(80));
+    }
 
-fn print_basic_clients(clients: &[samp_query::ServerClient]) {
-    println!("┌──────────────────────────────────────────────┐");
-    println!("│ {:<25} │ {:>16} │", "Name", "Score");
-    println!("├──────────────────────────────────────────────┤");
-    for (i, player) in clients.iter().enumerate() {
-        if i >= 15 {
-            println!("│ ... and {} more {:<23} │", clients.len() - 15, "");
-            break;
+    let mut online_total = 0;
+
+    for chunk in cfg.targets.chunks(50) {
+        let chunk_vec = chunk.to_vec();
+
+        match query_info_batch(chunk_vec, cfg.timeout, cfg.retry, 2000, 4) {
+            Ok(results) => {
+                for res in results {
+                    match res.result {
+                        Ok(info) => {
+                            online_total += 1;
+                            if cfg.json {
+                                let _ = writeln!(
+                                    w,
+                                    "{{ \"ip\": \"{}\", \"hostname\": {:?}, \"players\": {} }},",
+                                    res.target, info.hostname, info.players
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    w,
+                                    "{:<21} {:<9} {:<15} {}",
+                                    res.target.to_string(),
+                                    format!("{}/{}", info.players, info.max_players),
+                                    format!("{:.0}ms", res.rtt.as_millis()),
+                                    truncate(&info.hostname, 35)
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            if !cfg.json {
+                                let _ = writeln!(
+                                    w,
+                                    "{:<21} {:<9} {:<15} [OFFLINE]",
+                                    res.original_input, "-", "-"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(w, "Chunk Error: {}", e);
+            }
         }
-        println!(
-            "│ {:<25} │ {:>16} │",
-            truncate(&player.name, 25),
-            player.score
+        let _ = w.flush();
+    }
+
+    if !cfg.json {
+        let _ = writeln!(w, "{}", "-".repeat(80));
+        let _ = writeln!(
+            w,
+            "Scan Complete. Online: {}/{}",
+            online_total,
+            cfg.targets.len()
         );
     }
-    println!("└──────────────────────────────────────────────┘");
+}
+
+struct Table {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+impl Table {
+    fn new() -> Self {
+        Self {
+            headers: vec![],
+            rows: vec![],
+        }
+    }
+
+    fn set_headers(&mut self, headers: Vec<&str>) {
+        self.headers = headers.iter().map(|s| s.to_string()).collect();
+    }
+
+    fn add_row(&mut self, row: Vec<String>) {
+        self.rows.push(row);
+    }
+
+    fn print<W: Write>(&self, w: &mut W) {
+        if self.rows.is_empty() {
+            return;
+        }
+
+        let cols = self.rows[0].len();
+        let mut widths = vec![0; cols];
+
+        for (i, h) in self.headers.iter().enumerate() {
+            if i < cols {
+                widths[i] = widths[i].max(h.chars().count());
+            }
+        }
+        for row in &self.rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i < cols {
+                    widths[i] = widths[i].max(cell.chars().count());
+                }
+            }
+        }
+
+        for w in &mut widths {
+            *w += 2;
+        }
+        self.print_separator(w, &widths, "┌", "─", "┐", "┬");
+
+        if !self.headers.is_empty() {
+            write!(w, "│").unwrap();
+            for (i, h) in self.headers.iter().enumerate() {
+                write!(w, "{:width$}", format!(" {}", h), width = widths[i]).unwrap();
+                if i < cols - 1 {
+                    write!(w, "│").unwrap();
+                }
+            }
+            writeln!(w, "│").unwrap();
+            self.print_separator(w, &widths, "├", "─", "┤", "┼");
+        }
+
+        for row in &self.rows {
+            write!(w, "│").unwrap();
+            for (i, cell) in row.iter().enumerate() {
+                write!(w, "{:width$}", format!(" {}", cell), width = widths[i]).unwrap();
+                if i < cols - 1 {
+                    write!(w, "│").unwrap();
+                }
+            }
+            writeln!(w, "│").unwrap();
+        }
+
+        self.print_separator(w, &widths, "└", "─", "┘", "┴");
+    }
+
+    fn print_separator<W: Write>(
+        &self,
+        w: &mut W,
+        widths: &[usize],
+        left: &str,
+        mid: &str,
+        right: &str,
+        join: &str,
+    ) {
+        write!(w, "{}", left).unwrap();
+        for (i, width) in widths.iter().enumerate() {
+            write!(w, "{}", mid.repeat(*width)).unwrap();
+            if i < widths.len() - 1 {
+                write!(w, "{}", join).unwrap();
+            }
+        }
+        writeln!(w, "{}", right).unwrap();
+    }
+}
+
+fn parse_args() -> Result<Config, String> {
+    let args: Vec<String> = env::args().collect();
+    let mut targets = Vec::new();
+    let mut timeout = Duration::from_secs(2);
+    let mut json = false;
+    let mut retry = 1;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--timeout" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value for --timeout".to_string());
+                }
+                let secs: u64 = args[i].parse().map_err(|_| "Invalid timeout number")?;
+                timeout = Duration::from_secs(secs);
+            }
+            "--retry" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Missing value for --retry".to_string());
+                }
+                retry = args[i].parse().map_err(|_| "Invalid retry number")?;
+            }
+            val if val.starts_with("--") => return Err(format!("Unknown flag: {}", val)),
+            val => targets.push(val.to_string()),
+        }
+        i += 1;
+    }
+
+    Ok(Config {
+        batch: targets.len() > 1,
+        targets,
+        timeout,
+        json,
+        retry,
+    })
+}
+
+fn style(text: &str, code: &str) -> String {
+    if std::env::var("NO_COLOR").is_ok() {
+        text.to_string()
+    } else {
+        format!("\x1b[{}m{}\x1b[0m", code, text)
+    }
 }
 
 fn truncate(s: &str, max_width: usize) -> String {
@@ -166,4 +379,20 @@ fn truncate(s: &str, max_width: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn print_help<W: Write>(w: &mut W) {
+    let _ = writeln!(
+        w,
+        "
+Usage:
+  Single check : cargo run --example cli -- <IP:PORT>
+  Batch scan   : cargo run --example cli -- <IP1> <IP2> ...
+  
+Options:
+  --json       : Output results in JSON format
+  --timeout N  : Set socket timeout in seconds (default: 2)
+  --retry N    : Set number of retries per server (default: 1)
+"
+    );
 }
