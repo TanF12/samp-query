@@ -426,10 +426,16 @@ impl SampClient {
             let count = r.read_le_u16()?;
             let mut clients = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                clients.push(ServerClient {
-                    name: r.read_str_u8()?.into_owned(),
-                    score: r.read_le_i32()?,
-                });
+                let name = match r.read_str_u8() {
+                    Ok(v) => v.into_owned(),
+                    Err(_) => break,
+                };
+                let score = match r.read_le_i32() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
+                clients.push(ServerClient { name, score });
             }
             Ok(clients)
         })
@@ -445,11 +451,28 @@ impl SampClient {
             let count = r.read_le_u16()?;
             let mut clients = Vec::with_capacity(count as usize);
             for _ in 0..count {
+                let player_id = match r.read_u8() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let name = match r.read_str_u8() {
+                    Ok(v) => v.into_owned(),
+                    Err(_) => break,
+                };
+                let score = match r.read_le_i32() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let ping = match r.read_le_u32() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+
                 clients.push(ServerDetailedClient {
-                    player_id: r.read_u8()?,
-                    name: r.read_str_u8()?.into_owned(),
-                    score: r.read_le_i32()?,
-                    ping: r.read_le_u32()?,
+                    player_id,
+                    name,
+                    score,
+                    ping,
                 });
             }
             Ok(clients)
@@ -649,14 +672,15 @@ pub fn query_info_batch(
                 let (host, addr, retries_left) = send_queue.pop_front().unwrap();
 
                 if let Some(&last_sent) = ip_last_sent.get(&addr.ip())
-                    && now.duration_since(last_sent) < MIN_INTERVAL_PER_IP {
-                        delayed_queue.push(DelayedRequest {
-                            host,
-                            addr,
-                            retries_left,
-                            ready_at: last_sent + MIN_INTERVAL_PER_IP,
-                        });
-                        continue;
+                    && now.duration_since(last_sent) < MIN_INTERVAL_PER_IP
+                {
+                    delayed_queue.push(DelayedRequest {
+                        host,
+                        addr,
+                        retries_left,
+                        ready_at: last_sent + MIN_INTERVAL_PER_IP,
+                    });
+                    continue;
                 }
 
                 ip_last_sent.insert(addr.ip(), now);
