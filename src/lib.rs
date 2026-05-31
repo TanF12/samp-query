@@ -119,6 +119,14 @@ pub struct ServerClient {
     pub score: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServerDetailedClient {
+    pub player_id: u8,
+    pub name: String,
+    pub score: i32,
+    pub ping: u32,
+}
+
 pub struct BatchResult {
     pub target: SocketAddr,
     pub original_input: String,
@@ -427,6 +435,27 @@ impl SampClient {
         })
     }
 
+    pub fn get_detailed_clients(
+        &self,
+        target: impl ToSocketAddrs,
+    ) -> Result<Vec<ServerDetailedClient>, SampError> {
+        let addr = self.resolve(target)?;
+        self.send_recv(addr, Opcode::Detailed, None, |data| {
+            let mut r = ByteReader::new(data);
+            let count = r.read_le_u16()?;
+            let mut clients = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                clients.push(ServerDetailedClient {
+                    player_id: r.read_u8()?,
+                    name: r.read_str_u8()?.into_owned(),
+                    score: r.read_le_i32()?,
+                    ping: r.read_le_u32()?,
+                });
+            }
+            Ok(clients)
+        })
+    }
+
     pub fn get_ping(&self, target: impl ToSocketAddrs) -> Result<Duration, SampError> {
         let addr = self.resolve(target)?;
         let mut rng = FastRng::new();
@@ -619,8 +648,8 @@ pub fn query_info_batch(
 
                 let (host, addr, retries_left) = send_queue.pop_front().unwrap();
 
-                if let Some(&last_sent) = ip_last_sent.get(&addr.ip()) {
-                    if now.duration_since(last_sent) < MIN_INTERVAL_PER_IP {
+                if let Some(&last_sent) = ip_last_sent.get(&addr.ip())
+                    && now.duration_since(last_sent) < MIN_INTERVAL_PER_IP {
                         delayed_queue.push(DelayedRequest {
                             host,
                             addr,
@@ -628,7 +657,6 @@ pub fn query_info_batch(
                             ready_at: last_sent + MIN_INTERVAL_PER_IP,
                         });
                         continue;
-                    }
                 }
 
                 ip_last_sent.insert(addr.ip(), now);
@@ -652,10 +680,10 @@ pub fn query_info_batch(
             while let Some(&(ip, expire)) = ip_cleanup_queue.front() {
                 if now >= expire {
                     ip_cleanup_queue.pop_front();
-                    if let std::collections::hash_map::Entry::Occupied(e) = ip_last_sent.entry(ip) {
-                        if *e.get() <= expire - MIN_INTERVAL_PER_IP {
-                            e.remove();
-                        }
+                    if let std::collections::hash_map::Entry::Occupied(e) = ip_last_sent.entry(ip)
+                        && *e.get() <= expire - MIN_INTERVAL_PER_IP
+                    {
+                        e.remove();
                     }
                 } else {
                     break;
