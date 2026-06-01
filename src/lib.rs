@@ -16,6 +16,7 @@ const MAX_PACKET_SIZE: usize = 2048;
 const MAX_STRING_LEN: usize = 64;
 const MIN_INTERVAL_PER_IP: Duration = Duration::from_millis(500);
 
+// CP1251 - Cyrillic
 static CP1251_TABLE: [char; 128] = [
     '\u{0402}', '\u{0403}', '\u{201A}', '\u{0453}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
     '\u{20AC}', '\u{2030}', '\u{0409}', '\u{2039}', '\u{040A}', '\u{040C}', '\u{040B}', '\u{040F}',
@@ -33,6 +34,26 @@ static CP1251_TABLE: [char; 128] = [
     '\u{0438}', '\u{0439}', '\u{043A}', '\u{043B}', '\u{043C}', '\u{043D}', '\u{043E}', '\u{043F}',
     '\u{0440}', '\u{0441}', '\u{0442}', '\u{0443}', '\u{0444}', '\u{0445}', '\u{0446}', '\u{0447}',
     '\u{0448}', '\u{0449}', '\u{044A}', '\u{044B}', '\u{044C}', '\u{044D}', '\u{044E}', '\u{044F}',
+];
+
+// CP1252 - Western European (Latin)
+static CP1252_TABLE: [char; 128] = [
+    '\u{20AC}', '\u{0081}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{008D}', '\u{017D}', '\u{008F}',
+    '\u{0090}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}', '\u{0153}', '\u{009D}', '\u{017E}', '\u{0178}',
+    '\u{00A0}', '\u{00A1}', '\u{00A2}', '\u{00A3}', '\u{00A4}', '\u{00A5}', '\u{00A6}', '\u{00A7}',
+    '\u{00A8}', '\u{00A9}', '\u{00AA}', '\u{00AB}', '\u{00AC}', '\u{00AD}', '\u{00AE}', '\u{00AF}',
+    '\u{00B0}', '\u{00B1}', '\u{00B2}', '\u{00B3}', '\u{00B4}', '\u{00B5}', '\u{00B6}', '\u{00B7}',
+    '\u{00B8}', '\u{00B9}', '\u{00BA}', '\u{00BB}', '\u{00BC}', '\u{00BD}', '\u{00BE}', '\u{00BF}',
+    '\u{00C0}', '\u{00C1}', '\u{00C2}', '\u{00C3}', '\u{00C4}', '\u{00C5}', '\u{00C6}', '\u{00C7}',
+    '\u{00C8}', '\u{00C9}', '\u{00CA}', '\u{00CB}', '\u{00CC}', '\u{00CD}', '\u{00CE}', '\u{00CF}',
+    '\u{00D0}', '\u{00D1}', '\u{00D2}', '\u{00D3}', '\u{00D4}', '\u{00D5}', '\u{00D6}', '\u{00D7}',
+    '\u{00D8}', '\u{00D9}', '\u{00DA}', '\u{00DB}', '\u{00DC}', '\u{00DD}', '\u{00DE}', '\u{00DF}',
+    '\u{00E0}', '\u{00E1}', '\u{00E2}', '\u{00E3}', '\u{00E4}', '\u{00E5}', '\u{00E6}', '\u{00E7}',
+    '\u{00E8}', '\u{00E9}', '\u{00EA}', '\u{00EB}', '\u{00EC}', '\u{00ED}', '\u{00EE}', '\u{00EF}',
+    '\u{00F0}', '\u{00F1}', '\u{00F2}', '\u{00F3}', '\u{00F4}', '\u{00F5}', '\u{00F6}', '\u{00F7}',
+    '\u{00F8}', '\u{00F9}', '\u{00FA}', '\u{00FB}', '\u{00FC}', '\u{00FD}', '\u{00FE}', '\u{00FF}',
 ];
 
 #[repr(u8)]
@@ -192,12 +213,38 @@ impl<'a> ByteReader<'a> {
             ));
         }
 
+        if let Ok(s) = std::str::from_utf8(slice) {
+            return Ok(Cow::Owned(s.to_string()));
+        }
+
+        let mut consecutive_high = 0;
+        let mut max_consecutive = 0;
+        let mut total_high = 0;
+
+        for &b in slice {
+            if b >= 0x80 {
+                consecutive_high += 1;
+                if consecutive_high > max_consecutive {
+                    max_consecutive = consecutive_high;
+                }
+                total_high += 1;
+            } else {
+                consecutive_high = 0;
+            }
+        }
+
+        let is_cyrillic = max_consecutive >= 3 || total_high > 4;
+
         let mut s = String::with_capacity(len);
         for &b in slice {
             s.push(if b < 128 {
                 b as char
             } else {
-                CP1251_TABLE[(b - 0x80) as usize]
+                if is_cyrillic {
+                    CP1251_TABLE[(b - 0x80) as usize]
+                } else {
+                    CP1252_TABLE[(b - 0x80) as usize]
+                }
             });
         }
         Ok(Cow::Owned(s))
